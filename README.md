@@ -1,41 +1,135 @@
-# PestGuard 研究代码（可运行骨架）
+# PestGuard Research Code (Runnable Skeleton)
 
-本项目按用户提供的 PestGuard 主文与补充文件实现**防御推理核心**，参考 [AntiStyler 官方演示仓库](https://github.com/IdanYankelev/AntiStyler) 的前五层 VGG19 卷积特征与 Gram 矩阵构造。代码为独立实现，不复制其 Notebook。
+This project implements the core defense-inference pipeline described in the PestGuard paper. It also refers to the [official AntiStyler demonstration repository](https://github.com/IdanYankelev/AntiStyler) for the construction of VGG-19 style features and Gram matrices. The implementation is independent and does not copy the AntiStyler notebook.
 
-## 已实现
+The current version is intended to validate the method pipeline, interface integration, and boundary conditions. Hyperparameters that are not explicitly specified in the paper are clearly labeled as implementation defaults. These defaults alone must not be used to claim reproduction of the AP, ASR, or ablation results reported in the paper.
 
-1. 原图加 10 像素随机边框，固定随机风格参考；冻结 VGG19，仅对图像做一次风格损失梯度上升。
-2. 裁掉边框，计算逐像素 `mean_RGB(abs(crop(z1)-x))`；计算**带符号** MAD 分数 `(r-median(r))/(1.4826*MAD+eps)`。
-3. 原图与弱变换视图的真实检测输出；逆映射弱视图框；按类进行匈牙利 IoU 匹配。
-4. 仅在匹配框交集内取 `max(sqrt(p*p'))` 构建保护图 `C`。
-5. `M0 = 1[a > tau0 + lambda*C]`；八邻域小连通域删除、3×3 闭运算、3×3 膨胀。
-6. 对最终掩膜的每个连通域，从周围未掩膜环带取各通道中位数填充；最后运行同一检测器。
-7. Faster R-CNN、Ultralytics YOLO、HuggingFace DETR 检测器适配器；保存所有中间图和原始浮点图。
-8. 101 点插值 AP50、隐藏与制造攻击成功判定工具函数，以及针对核心规则的测试。
-9. 按补充材料拟议几何构建补丁支撑域、替换补丁公式和 M-PGD 的 `16/255` 局部范数投影。
+## Method Overview
 
-## 必须由真实实验提供
+PestGuard is an image-preprocessing defense that requires no additional defense training. Its pipeline consists of the following steps:
 
-- 训练好的检测器 checkpoint 和其类别 ID 映射。
-- VGG19 checkpoint：主文写有 PDT 微调，但未给出权重或微调配置；若使用原始 ImageNet 权重，论文表述必须相应更正。
-- 准确的数据划分、攻击图、攻击优化代码与日志。补充文件里的多个数值是**拟议配置**，不能据此声称复现论文表格。
-- EOT、DPatch、T-SEA 和自适应 BPDA+EOT 的确切目标函数、随机变换分布与优化记录。`pestguard/patches.py` 只处理几何与约束，并不冒充这些完整攻击实现。
-- `style_step_size = eta*beta` 的数值；该值取决于 Gram 归一化、VGG 权重及输入规范，不能从 AP 表格反推。示例配置的 `1.0` 仅用于让程序具备显式默认值，使用前必须校准残差分布。
-- 当前 VGG 输入采用 ImageNet 均值/标准差归一化，随机参考图采用固定种子的 `[0,1]` 均匀噪声；主文没有给出这两项的确切实现，复现实验时须与作者代码或训练配置核对。Gram 损失按主文的 Frobenius 范数平方求和。
+1. Perform a one-step style-removal update to obtain a residual map that highlights regions potentially affected by adversarial patches.
+2. Robustly calibrate the residual using the median absolute deviation (MAD).
+3. Compare detections from the original image and a weakly transformed view to construct a cross-view target-protection map.
+4. Generate an adaptive mask from the residual score and the protection map.
+5. Refine the mask morphologically and fill the selected regions using surrounding canopy context.
+6. Send the processed image to the same frozen detector for final inference.
 
-## 安装
+Only the input image is updated during the defense process. The object detector and VGG-19 parameters remain frozen.
+
+## Implemented Components
+
+1. Add a 10-pixel random border around the original image and generate a fixed random style-reference image. VGG-19 remains frozen, and a single gradient-ascent step on the style loss is applied only to the input image. The updated image is clipped to `[0,1]`.
+2. Construct Gram matrices and the style loss from features extracted from the first five convolutional blocks of VGG-19. The exact layer indices are explicitly defined in the code to avoid ambiguity between convolutional blocks and individual convolutional layers.
+3. Remove the random border and compute the pixel-wise channel-averaged absolute residual:
+
+   ```text
+   r(u) = mean_RGB(abs(crop(z1)(u) - x(u)))
+   ```
+
+4. Compute the signed MAD-calibrated score according to the equation in the paper:
+
+   ```text
+   a(u) = (r(u) - median(r)) /
+          (1.4826 * median(abs(r - median(r))) + eps)
+   ```
+
+   The numerator is not converted to an absolute value. Pixels below the residual median can therefore receive negative scores.
+5. Run the detector on the original image and the weakly transformed view, then map the weak-view predictions back to the original image coordinates.
+6. Perform class-wise Hungarian matching using IoU as the matching criterion and retain only pairs whose IoU is not lower than `rho`.
+7. Construct the target-protection map only inside the intersection of each retained matched-box pair:
+
+   ```text
+   C(u) = max_j sqrt(p_j * p'_j) * 1[u in b_j intersect b'_j]
+   ```
+
+   If a pixel is not covered by the intersection of any retained matched pair, then `C(u) = 0`.
+8. Generate the preliminary adaptive mask:
+
+   ```text
+   M0(u) = 1[a(u) > tau0 + lambda * C(u)]
+   ```
+
+9. Remove small connected components, apply morphological closing, and dilate the result to obtain the final mask. Eight-connectivity, 3×3 structuring elements, and the minimum component size are explicit defaults of the current implementation.
+10. For each connected component in the final mask, compute the channel-wise median from the surrounding unmasked annulus and use it to fill the component.
+11. Preserve the original pixels outside the mask and send only the locally filled original image to the same frozen detector for final inference. The style-updated image is used only to compute the residual and is not used directly as the final detector input.
+12. Provide adapters for Faster R-CNN, Ultralytics YOLO, and HuggingFace DETR detectors.
+13. Save defended images, weak views, style-updated images, visualization heatmaps, raw floating-point maps, and detection outputs.
+14. Provide utility functions for 101-point interpolated AP50, hiding-attack success, and creation-attack success.
+15. Provide utilities for constructing patch support regions, applying patch replacements, and enforcing the local `16/255` norm constraint for M-PGD.
+16. Include unit tests for residual computation, MAD calibration, inverse box mapping, Hungarian matching, protection-map construction, mask processing, and local filling.
+
+## Settings Explicitly Specified in the Paper
+
+- The random border width is 10 pixels.
+- A fixed random image is used as the style reference.
+- A frozen, pretrained VGG-19 is used.
+- Style features are extracted from its first five convolutional blocks.
+- The style loss is the sum of squared Frobenius norms between Gram matrices at the selected layers.
+- A single style-loss gradient-ascent step is performed, and image values are clipped to `[0,1]`.
+- The weak view includes resize-pad and mild photometric jitter.
+- Detection boxes of the same class are matched using Hungarian matching based on IoU.
+- Mask refinement includes small-component removal, morphological closing, and dilation.
+- Each masked region is filled using the channel-wise median of its surrounding annulus.
+- The default attack places one patch on a selected crown with a patch-to-box area ratio of 1.0.
+- M-PGD uses an `L_inf` bound of `16/255` inside the patch region.
+- Adaptive evaluation uses BPDA+EOT with a straight-through gradient estimator.
+- The detector and VGG-19 remain frozen during defense inference.
+
+## Information Requiring Real Experimental Resources or Author Configuration
+
+- Trained detector checkpoints and the class-ID mapping used by each dataset.
+- The exact VGG-19 checkpoint. The paper only states that a frozen, pretrained VGG-19 is used; it does not specify the pretraining dataset, weight version, or whether task-specific fine-tuning was performed.
+- The exact VGG-19 layer indices corresponding to the five convolutional blocks.
+- The experimental values of `eta`, `beta`, or their product used as the effective style-update step size.
+- The distribution, resolution handling, and random seed used to generate the random style-reference image.
+- The input normalization applied before VGG-19 inference.
+- The experimental values of `rho`, `tau0`, `lambda`, and `eps`.
+- The minimum connected-component threshold, morphological structuring-element sizes, and iteration counts.
+- The inner and outer radii of the local filling annulus and the fallback rule when too few valid annulus pixels are available.
+- The exact scaling, brightness, contrast, and padding ranges used for weak-view generation.
+- The exact training, validation, and test splits for PDT, FDLC, and PWD.
+- Detector training configurations, best-checkpoint selection records, and detector-specific preprocessing.
+- Complete objectives, transformation distributions, iteration counts, step sizes, and optimization logs for EOT, DPatch, T-SEA, and adaptive BPDA+EOT.
+- Complete hiding- and creation-success protocols for multiple targets, multiple predictions, and no-target images.
+- The exact evaluator configuration used to produce the AP50 and ASR values reported in the paper.
+
+Without this information, the current code can execute and validate the algorithmic pipeline, but it cannot automatically reproduce the numerical results in the paper.
+
+## Installation
 
 ```bash
 python -m pip install -r requirements.txt
 ```
 
-当前代码可在 CPU 运行，但 640×640 的 VGG 梯度步骤建议使用 GPU。若使用 YOLO 或 DETR，再分别安装 `ultralytics` 或 `transformers`。不要用随机初始化的模型做论文实验。
+The code can run on CPU, but a GPU is recommended for the VGG-19 gradient step on 640×640 images.
 
-## 推理
+Install the corresponding optional dependency when using YOLO or DETR:
+
+```bash
+python -m pip install ultralytics
+python -m pip install transformers
+```
+
+Do not use randomly initialized detectors or VGG-19 models for paper experiments.
+
+## Configuration
+
+The example configuration file is:
+
+```text
+config_proposed.json
+```
+
+Values not explicitly specified in the paper are implementation defaults. Before formal evaluation, calibrate them on the validation set and save the final configuration, random seeds, and execution logs.
+
+By default, the current implementation normalizes VGG inputs using the ImageNet mean and standard deviation and generates the random style reference from a fixed-seed uniform distribution over `[0,1]`. These are implementation choices and must not be presented as settings explicitly specified in the paper.
+
+## Inference
 
 ### Faster R-CNN
 
-`--num-classes` **包含背景类**。例如一个前景类的 torchvision 模型填 `2`，其前景标签通常为 `1`。
+`--num-classes` includes the background class. For example, a torchvision Faster R-CNN model with one foreground class normally uses `2`, with the foreground label usually set to `1`.
 
 ```bash
 python run_pestguard.py \
@@ -49,58 +143,164 @@ python run_pestguard.py \
   --device cuda:0
 ```
 
-### YOLO / DETR
+### YOLO
 
 ```bash
-python run_pestguard.py --input /path/to/image.jpg --output /path/to/results \
-  --detector yolo --detector-checkpoint /path/to/best.pt \
-  --vgg-checkpoint /path/to/vgg19.pt --config config_proposed.json
+python run_pestguard.py \
+  --input /path/to/image.jpg \
+  --output /path/to/results \
+  --detector yolo \
+  --detector-checkpoint /path/to/best.pt \
+  --vgg-checkpoint /path/to/vgg19.pt \
+  --config config_proposed.json \
+  --device cuda:0
 ```
 
-对 DETR 使用 `--detector detr`，并将 `--detector-checkpoint` 指向含有模型和 image processor 的**本地** HuggingFace 目录。适配器不主动下载权重。
+### DETR
 
-程序保存 `defended.png`、`style_updated_crop.png`、`weak_view.png`、预览热图、`maps.npz` 与 `result.json`。**MAD 原始值在 `maps.npz` 中**；预览 PNG 为便于查看而作的显示归一化，不是 0–1 的算法分数。
+```bash
+python run_pestguard.py \
+  --input /path/to/image.jpg \
+  --output /path/to/results \
+  --detector detr \
+  --detector-checkpoint /path/to/local_detr_directory \
+  --vgg-checkpoint /path/to/vgg19.pt \
+  --config config_proposed.json \
+  --device cuda:0
+```
 
-## 评估 PDT 的 YOLO 标注
+For DETR, `--detector-checkpoint` must point to a local HuggingFace directory containing both the model weights and image-processor configuration. The adapter does not download weights automatically.
 
-`evaluate_outputs.py` 读取已保存的预测结果和 YOLO `.txt`。无目标图应有空 `.txt` 文件；缺失标注会报错。若检测器是 torchvision Faster R-CNN、YOLO 类别为 `0`，则用 `--label-class-offset 1 --class-ids 1`。YOLO 检测器通常用 `--label-class-offset 0 --class-ids 0`。
+## Output Files
+
+The program saves the following files for each input image:
+
+| File | Description |
+|---|---|
+| `defended.png` | Final locally filled defense image |
+| `style_updated_crop.png` | Image after one style update and border removal |
+| `weak_view.png` | Weakly transformed image used for cross-view consistency |
+| `residual_preview.png` | Display preview of the residual map |
+| `mad_preview.png` | Display preview of the MAD-calibrated score |
+| `protection_preview.png` | Display preview of the cross-view target-protection map |
+| `mask_preview.png` | Display preview of the final mask |
+| `maps.npz` | Raw floating-point residuals, MAD scores, protection maps, and masks |
+| `result.json` | Detections and runtime information for the original, weak-view, and final defended images |
+
+`maps.npz` contains the raw floating-point values used by the algorithm. Preview PNG files are normalized for visualization and must not be interpreted directly as algorithm scores.
+
+## Evaluating PDT with YOLO-Format Annotations
+
+`evaluate_outputs.py` reads saved predictions and YOLO-format `.txt` annotations.
+
+- A no-target image must have a corresponding empty `.txt` file.
+- A missing annotation file raises an error.
+- If the detector is torchvision Faster R-CNN and the YOLO foreground class is `0`, use `--label-class-offset 1 --class-ids 1`.
+- If the detector itself uses zero-based class IDs, normally use `--label-class-offset 0 --class-ids 0`.
+
+Faster R-CNN example:
 
 ```bash
 python evaluate_outputs.py \
   --results /path/to/results \
   --labels /path/to/test/labels \
-  --class-ids 1 --label-class-offset 1 \
+  --class-ids 1 \
+  --label-class-offset 1 \
   --prediction-key detections_final \
   --output /path/to/ap50.json
 ```
 
-评估器采用补充材料**拟议**的 101 点 AP50、0.001 置信度下限和每图最多 300 框。要对照论文表格，先核实原实验的评价器、数据清单和攻击样本。`hiding_success` 与 `creation_success` 是分开的，不会把两者自动合并成主文未说明的 ASR。
+YOLO example:
 
-## 测试
+```bash
+python evaluate_outputs.py \
+  --results /path/to/results \
+  --labels /path/to/test/labels \
+  --class-ids 0 \
+  --label-class-offset 0 \
+  --prediction-key detections_final \
+  --output /path/to/ap50.json
+```
+
+The current evaluator uses 101-point interpolated AP50, a confidence floor of `0.001`, and at most 300 predictions per image. These are evaluator settings of the current implementation; the paper does not provide the corresponding details. Before comparing against the reported results, verify the original image list, class mapping, prediction-filtering rules, and AP implementation.
+
+`hiding_success` and `creation_success` evaluate hiding and creation attacks separately. The code does not combine them into a single ASR without an explicitly defined aggregation protocol.
+
+## Scope of the Attack Utilities
+
+`pestguard/patches.py` implements the following basic operations:
+
+- Construct a patch support region from a target box and a specified area ratio.
+- Insert a patch into the permitted image region.
+- Project M-PGD updates onto the local `16/255` norm constraint inside the patch region.
+- Keep all pixels outside the patch region unchanged.
+
+These utilities do not constitute complete implementations of EOT, DPatch, T-SEA, or BPDA+EOT. A complete attack additionally requires an objective function, initialization scheme, iteration count, step size, random transformation distribution, target-selection policy, and stopping rule.
+
+## Tests
 
 ```bash
 python -m unittest discover -s tests -v
 ```
 
-测试中的微型假检测器只检查程序连接、坐标与边界条件，**不提供实验性能证据**。
+The tests use a lightweight mock detector to verify that:
 
-## 与 AntiStyler 的关系
+- The full inference pipeline is connected correctly.
+- Image coordinates and detection boxes are transformed and mapped back correctly.
+- Hungarian matching respects class identities and the IoU threshold.
+- The protection map responds only inside matched-box intersections.
+- MAD scores retain their signed form.
+- Morphological mask processing and local filling satisfy boundary conditions.
+- Empty detections, empty masks, and connected components touching image boundaries are handled safely.
 
-AntiStyler 演示 Notebook 使用优化步骤、基于高分位差值的掩膜、形态学处理及遮罩图像。PestGuard 主文要求**单步**风格更新、MAD 校准、跨视图目标保护和局部中位数填充。本实现遵循 PestGuard 公式；它不是 AntiStyler Notebook 的逐行复刻，也没有声称得到主文中任何 AP 或 ASR 数值。
+These tests validate program logic only and provide no evidence of experimental performance.
 
-## 参数来源
+## Relationship to AntiStyler
 
-| 参数 | 默认值 | 来源/状态 |
+AntiStyler uses style-removal responses to locate potential adversarial patches and masks suspicious regions. Building on this idea, PestGuard uses a one-step style update, robust MAD calibration, cross-view target protection, and local median filling to reduce the accidental removal of useful features from small pest-damaged crowns.
+
+This project refers to the AntiStyler demonstration for VGG-19 style-feature and Gram-matrix construction. It does not reproduce the notebook line by line and does not automatically treat AntiStyler hyperparameters as PestGuard experimental settings.
+
+## Parameter Sources and Status
+
+| Parameter | Current Default | Source/Status |
 |---|---:|---|
-| 随机边框 | 10 px | 主文明确描述 |
-| VGG 风格层 | 前五个卷积 | 主文/AntiStyler 演示所述，准确层选择需与权重核对 |
-| `style_step_size` | 1.0 | 占位有效步长，须实测校准 |
-| `eps` | 1e-6 | 补充材料拟议 |
-| `rho` | 0.5 | 补充材料拟议 |
-| 检测置信度下限 | 0.25 | 补充材料拟议 |
-| `tau0, lambda` | 3.0, 2.0 | 补充材料拟议 |
-| 最小连通域 | 16 px | 补充材料拟议 |
-| 环带内外半径 | 3, 9 px | 补充材料拟议 |
-| 弱视图缩放、亮度、对比度 | 0.95–1.05 | 补充材料拟议 |
+| Random border | 10 px | Explicitly specified in the paper |
+| VGG style features | First five convolutional blocks | Explicitly specified in the paper; exact layer indices must be fixed in the implementation |
+| `style_step_size` | 1.0 | Implementation default; not numerically specified in the paper and requires experimental calibration |
+| `eps` | 1e-6 | Numerical-stability default; the paper only requires `eps > 0` |
+| `rho` | 0.5 | Implementation default; not numerically specified in the paper |
+| Detection confidence floor | 0.25 | Implementation default; not numerically specified in the paper |
+| `tau0` | 3.0 | Implementation default; not numerically specified in the paper |
+| `lambda` | 2.0 | Implementation default; not numerically specified in the paper |
+| Minimum connected component | 16 px | Implementation default; not numerically specified in the paper |
+| Connectivity | Eight-connectivity | Implementation default; not specified in the paper |
+| Closing structuring element | 3×3 | Implementation default; not numerically specified in the paper |
+| Dilation structuring element | 3×3 | Implementation default; not numerically specified in the paper |
+| Annulus inner/outer radii | 3 px, 9 px | Implementation default; not numerically specified in the paper |
+| Weak-view scale | 0.95–1.05 | Implementation default; the paper only specifies a mild transformation |
+| Weak-view brightness | 0.95–1.05 | Implementation default; the paper only specifies mild photometric jitter |
+| Weak-view contrast | 0.95–1.05 | Implementation default; the paper only specifies mild photometric jitter |
+| M-PGD local bound | 16/255 | Explicitly specified in the paper |
+| Patch-to-box area ratio | 1.0 | Explicitly specified in the paper |
 
-补充材料里的参考研究数据规模、合成表 S9/S10 和未验证训练设置均**未写入本项目作为真实结果**。
+## Reproducibility Recommendations
+
+For each formal experiment, save the following information:
+
+1. Dataset splits and the complete test-image list.
+2. Hashes of the detector and VGG-19 checkpoints.
+3. Class names and class-ID mappings.
+4. The complete configuration file.
+5. Python, PyTorch, torchvision, CUDA, and detector-framework versions.
+6. All random seeds.
+7. Complete configurations and optimization logs for every attack.
+8. Raw per-image predictions, AP evaluator inputs, and ASR decisions.
+9. Images before and after defense, together with raw floating-point intermediate maps.
+10. Failure cases and runtime exception logs.
+
+Strict comparison with the paper requires identical data, weights, attacks, evaluator settings, and method parameters.
+
+## Disclaimer
+
+The current project is a runnable research skeleton derived from the method description publicly available in the paper. It does not include unpublished checkpoints, dataset splits, attack logs, or private training configurations. The code can validate the method pipeline, but it does not guarantee reproduction of the reported numerical results without the original experimental resources.

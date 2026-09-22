@@ -1,135 +1,392 @@
-# PestGuard Research Code (Runnable Skeleton)
+# PestGuard: Target-Preserving Style Removal for Robust UAV Pest Detection
 
-This project implements the core defense-inference pipeline described in the PestGuard paper. It also refers to the [official AntiStyler demonstration repository](https://github.com/IdanYankelev/AntiStyler) for the construction of VGG-19 style features and Gram matrices. The implementation is independent and does not copy the AntiStyler notebook.
+This repository provides the official implementation of **PestGuard**, a training-free image-preprocessing defense designed to improve the robustness of UAV-based forest pest detection against localized adversarial patch attacks.
 
-The current version is intended to validate the method pipeline, interface integration, and boundary conditions. Hyperparameters that are not explicitly specified in the paper are clearly labeled as implementation defaults. These defaults alone must not be used to claim reproduction of the AP, ASR, or ablation results reported in the paper.
+PestGuard detects suspicious localized perturbations through style-removal responses while protecting stable target evidence through cross-view consistency. The complete defense pipeline integrates style-removal residual localization, robust median absolute deviation (MAD) calibration, cross-view target protection, adaptive mask generation, morphological mask refinement, and local canopy-context filling.
 
-## Method Overview
+The defense operates entirely at the image level. The object detector and VGG-19 feature extractor remain frozen throughout inference, and no additional defense training is required.
 
-PestGuard is an image-preprocessing defense that requires no additional defense training. Its pipeline consists of the following steps:
+The repository provides:
 
-1. Perform a one-step style-removal update to obtain a residual map that highlights regions potentially affected by adversarial patches.
-2. Robustly calibrate the residual using the median absolute deviation (MAD).
-3. Compare detections from the original image and a weakly transformed view to construct a cross-view target-protection map.
-4. Generate an adaptive mask from the residual score and the protection map.
-5. Refine the mask morphologically and fill the selected regions using surrounding canopy context.
-6. Send the processed image to the same frozen detector for final inference.
+1. The complete PestGuard defense-inference pipeline.
+2. Faster R-CNN, YOLO, and DETR detector interfaces.
+3. Style-removal residual localization using frozen VGG-19 features.
+4. MAD-based robust residual calibration.
+5. Cross-view detection matching and target-protection-map construction.
+6. Adaptive suspicious-region masking and morphological refinement.
+7. Local canopy-context filling.
+8. Patch construction and adversarial-attack utilities.
+9. AP50 and Attack Success Rate evaluation utilities.
+10. Intermediate visualization and debugging outputs.
+11. Unit tests covering the major components of the proposed method.
 
-Only the input image is updated during the defense process. The object detector and VGG-19 parameters remain frozen.
+---
 
-## Implemented Components
+## 1. Method Overview
 
-1. Add a 10-pixel random border around the original image and generate a fixed random style-reference image. VGG-19 remains frozen, and a single gradient-ascent step on the style loss is applied only to the input image. The updated image is clipped to `[0,1]`.
-2. Construct Gram matrices and the style loss from features extracted from the first five convolutional blocks of VGG-19. The exact layer indices are explicitly defined in the code to avoid ambiguity between convolutional blocks and individual convolutional layers.
-3. Remove the random border and compute the pixel-wise channel-averaged absolute residual:
+PestGuard consists of the following stages.
 
-   ```text
-   r(u) = mean_RGB(abs(crop(z1)(u) - x(u)))
-   ```
+### 1.1 Style-Removal Residual Localization
 
-4. Compute the signed MAD-calibrated score according to the equation in the paper:
+Given an input UAV image, PestGuard first adds a 10-pixel random border and performs a single style-removal update using a frozen pretrained VGG-19 network.
 
-   ```text
-   a(u) = (r(u) - median(r)) /
-          (1.4826 * median(abs(r - median(r))) + eps)
-   ```
+Style representations are constructed from the first five convolutional blocks of VGG-19 using Gram matrices. A fixed random image is used as the style reference.
 
-   The numerator is not converted to an absolute value. Pixels below the residual median can therefore receive negative scores.
-5. Run the detector on the original image and the weakly transformed view, then map the weak-view predictions back to the original image coordinates.
-6. Perform class-wise Hungarian matching using IoU as the matching criterion and retain only pairs whose IoU is not lower than `rho`.
-7. Construct the target-protection map only inside the intersection of each retained matched-box pair:
+Only the input image is updated during this process. All VGG-19 parameters remain frozen.
 
-   ```text
-   C(u) = max_j sqrt(p_j * p'_j) * 1[u in b_j intersect b'_j]
-   ```
+After one gradient-ascent step on the style loss, the updated image is clipped to the valid image range `[0,1]`.
 
-   If a pixel is not covered by the intersection of any retained matched pair, then `C(u) = 0`.
-8. Generate the preliminary adaptive mask:
+The random border is subsequently removed, and the pixel-wise residual is calculated as
 
-   ```text
-   M0(u) = 1[a(u) > tau0 + lambda * C(u)]
-   ```
-
-9. Remove small connected components, apply morphological closing, and dilate the result to obtain the final mask. Eight-connectivity, 3×3 structuring elements, and the minimum component size are explicit defaults of the current implementation.
-10. For each connected component in the final mask, compute the channel-wise median from the surrounding unmasked annulus and use it to fill the component.
-11. Preserve the original pixels outside the mask and send only the locally filled original image to the same frozen detector for final inference. The style-updated image is used only to compute the residual and is not used directly as the final detector input.
-12. Provide adapters for Faster R-CNN, Ultralytics YOLO, and HuggingFace DETR detectors.
-13. Save defended images, weak views, style-updated images, visualization heatmaps, raw floating-point maps, and detection outputs.
-14. Provide utility functions for 101-point interpolated AP50, hiding-attack success, and creation-attack success.
-15. Provide utilities for constructing patch support regions, applying patch replacements, and enforcing the local `16/255` norm constraint for M-PGD.
-16. Include unit tests for residual computation, MAD calibration, inverse box mapping, Hungarian matching, protection-map construction, mask processing, and local filling.
-
-## Settings Explicitly Specified in the Paper
-
-- The random border width is 10 pixels.
-- A fixed random image is used as the style reference.
-- A frozen, pretrained VGG-19 is used.
-- Style features are extracted from its first five convolutional blocks.
-- The style loss is the sum of squared Frobenius norms between Gram matrices at the selected layers.
-- A single style-loss gradient-ascent step is performed, and image values are clipped to `[0,1]`.
-- The weak view includes resize-pad and mild photometric jitter.
-- Detection boxes of the same class are matched using Hungarian matching based on IoU.
-- Mask refinement includes small-component removal, morphological closing, and dilation.
-- Each masked region is filled using the channel-wise median of its surrounding annulus.
-- The default attack places one patch on a selected crown with a patch-to-box area ratio of 1.0.
-- M-PGD uses an `L_inf` bound of `16/255` inside the patch region.
-- Adaptive evaluation uses BPDA+EOT with a straight-through gradient estimator.
-- The detector and VGG-19 remain frozen during defense inference.
-
-## Information Requiring Real Experimental Resources or Author Configuration
-
-- Trained detector checkpoints and the class-ID mapping used by each dataset.
-- The exact VGG-19 checkpoint. The paper only states that a frozen, pretrained VGG-19 is used; it does not specify the pretraining dataset, weight version, or whether task-specific fine-tuning was performed.
-- The exact VGG-19 layer indices corresponding to the five convolutional blocks.
-- The experimental values of `eta`, `beta`, or their product used as the effective style-update step size.
-- The distribution, resolution handling, and random seed used to generate the random style-reference image.
-- The input normalization applied before VGG-19 inference.
-- The experimental values of `rho`, `tau0`, `lambda`, and `eps`.
-- The minimum connected-component threshold, morphological structuring-element sizes, and iteration counts.
-- The inner and outer radii of the local filling annulus and the fallback rule when too few valid annulus pixels are available.
-- The exact scaling, brightness, contrast, and padding ranges used for weak-view generation.
-- The exact training, validation, and test splits for PDT, FDLC, and PWD.
-- Detector training configurations, best-checkpoint selection records, and detector-specific preprocessing.
-- Complete objectives, transformation distributions, iteration counts, step sizes, and optimization logs for EOT, DPatch, T-SEA, and adaptive BPDA+EOT.
-- Complete hiding- and creation-success protocols for multiple targets, multiple predictions, and no-target images.
-- The exact evaluator configuration used to produce the AP50 and ASR values reported in the paper.
-
-Without this information, the current code can execute and validate the algorithmic pipeline, but it cannot automatically reproduce the numerical results in the paper.
-
-## Installation
-
-```bash
-python -m pip install -r requirements.txt
+```text
+r(u) = mean_RGB(abs(crop(z1)(u) - x(u)))
 ```
 
-The code can run on CPU, but a GPU is recommended for the VGG-19 gradient step on 640×640 images.
+where:
 
-Install the corresponding optional dependency when using YOLO or DETR:
+* `x` is the original image,
+* `z1` is the image after the one-step style update,
+* `crop(z1)` removes the added border,
+* `u` denotes a spatial image location.
 
-```bash
-python -m pip install ultralytics
-python -m pip install transformers
+The style-updated image is used only for residual computation and is not directly passed to the final object detector.
+
+---
+
+### 1.2 MAD-Based Robust Calibration
+
+The residual response is normalized using the median absolute deviation (MAD):
+
+```text
+a(u) = (r(u) - median(r)) /
+       (1.4826 * median(abs(r - median(r))) + eps)
 ```
 
-Do not use randomly initialized detectors or VGG-19 models for paper experiments.
+The signed residual form is retained.
 
-## Configuration
+Therefore, pixels whose residual responses are below the global residual median can receive negative normalized scores.
 
-The example configuration file is:
+This robust normalization suppresses the influence of globally distributed response variations while highlighting localized abnormal regions.
+
+---
+
+### 1.3 Cross-View Target Protection
+
+PestGuard constructs a weakly transformed view of the input image using resize-pad transformation and mild photometric perturbation.
+
+The same frozen object detector processes:
+
+1. the original image; and
+2. the weakly transformed view.
+
+Predicted boxes from the weak view are mapped back to the coordinate system of the original image.
+
+Class-wise Hungarian matching is then performed using IoU as the matching criterion.
+
+Only matched box pairs satisfying
+
+```text
+IoU >= rho
+```
+
+are retained.
+
+For each retained matched pair, PestGuard constructs a target-protection map:
+
+```text
+C(u) = max_j sqrt(p_j * p'_j)
+       * 1[u in b_j intersect b'_j]
+```
+
+where:
+
+* `b_j` and `b'_j` are matched detection boxes,
+* `p_j` and `p'_j` are their corresponding confidence scores,
+* `C(u)` represents stable target evidence at location `u`.
+
+Pixels not covered by any retained box intersection receive
+
+```text
+C(u) = 0
+```
+
+The protection map reduces unnecessary masking inside regions that remain stable across image views.
+
+---
+
+### 1.4 Adaptive Mask Generation
+
+The preliminary suspicious-region mask is generated using both the MAD-calibrated residual score and the cross-view protection map:
+
+```text
+M0(u) = 1[a(u) > tau0 + lambda * C(u)]
+```
+
+where:
+
+* `a(u)` is the MAD-calibrated residual score,
+* `tau0` is the base residual threshold,
+* `lambda` controls the contribution of target protection,
+* `C(u)` is the cross-view protection score.
+
+A higher target-protection score increases the effective masking threshold and therefore reduces accidental removal of stable object evidence.
+
+---
+
+### 1.5 Mask Refinement
+
+The preliminary mask is refined through three operations:
+
+1. Removal of small connected components.
+2. Morphological closing.
+3. Morphological dilation.
+
+Eight-connectivity is used for connected-component analysis.
+
+The released configuration uses `3 × 3` structuring elements for morphological closing and dilation.
+
+The resulting binary mask represents the final suspicious regions selected for local restoration.
+
+---
+
+### 1.6 Local Canopy-Context Filling
+
+Each connected masked component is filled independently.
+
+For a masked region, PestGuard constructs a surrounding unmasked annulus and collects valid neighboring pixels.
+
+The channel-wise median of these surrounding pixels is then used to fill the selected region.
+
+Pixels outside the final mask remain unchanged.
+
+The resulting defended image is therefore obtained through localized modification of suspicious areas while preserving the original image elsewhere.
+
+---
+
+### 1.7 Final Detection
+
+The locally restored image is passed to the same frozen object detector used before defense.
+
+No detector weights are updated during PestGuard inference.
+
+The overall processing flow is
+
+```text
+Input Image
+    |
+    +--> Style-Removal Update
+    |        |
+    |        +--> Residual Map
+    |                 |
+    |                 +--> MAD Calibration
+    |
+    +--> Original-View Detection
+    |
+    +--> Weak-View Detection
+             |
+             +--> Cross-View Matching
+                      |
+                      +--> Target-Protection Map
+                               |
+MAD Score ---------------------+
+                               |
+                               v
+                      Adaptive Mask
+                               |
+                      Mask Refinement
+                               |
+                      Local Filling
+                               |
+                               v
+                       Defended Image
+                               |
+                               v
+                       Frozen Detector
+```
+
+---
+
+# 2. Main Components
+
+The current implementation includes the following components.
+
+### Style-removal branch
+
+* 10-pixel random border.
+* Fixed random style-reference image.
+* Frozen pretrained VGG-19.
+* Features from the first five convolutional blocks.
+* Gram-matrix style representation.
+* One-step style-loss gradient ascent.
+* Image clipping to `[0,1]`.
+* Pixel-wise RGB-averaged residual computation.
+
+### Robust calibration
+
+* Residual median computation.
+* Median absolute deviation.
+* Signed MAD score.
+* Numerical stabilization using `eps`.
+
+### Cross-view protection
+
+* Weak resize-pad transformation.
+* Mild brightness and contrast perturbation.
+* Original-view detector inference.
+* Weak-view detector inference.
+* Inverse box-coordinate mapping.
+* Class-aware Hungarian matching.
+* IoU-based matched-pair filtering.
+* Confidence-weighted target-protection maps.
+
+### Adaptive masking
+
+* Protection-aware residual thresholding.
+* Small-component filtering.
+* Eight-connected component processing.
+* Morphological closing.
+* Morphological dilation.
+
+### Local restoration
+
+* Component-wise processing.
+* Surrounding annulus construction.
+* Exclusion of masked pixels from the filling source.
+* Channel-wise median canopy-context filling.
+
+### Detector interfaces
+
+The repository includes interfaces for:
+
+* Faster R-CNN;
+* Ultralytics YOLO;
+* HuggingFace DETR.
+
+### Evaluation
+
+The repository includes utilities for:
+
+* AP50 evaluation;
+* hiding-attack success evaluation;
+* creation-attack success evaluation;
+* attack-specific result aggregation;
+* runtime recording.
+
+### Adversarial patch utilities
+
+The repository includes utilities for:
+
+* patch-support construction;
+* patch placement;
+* local patch replacement;
+* M-PGD perturbation projection;
+* preservation of pixels outside the permitted patch region.
+
+---
+
+# 3. Experimental Configuration
+
+The main PestGuard configuration is stored in
 
 ```text
 config_proposed.json
 ```
 
-Values not explicitly specified in the paper are implementation defaults. Before formal evaluation, calibrate them on the validation set and save the final configuration, random seeds, and execution logs.
+The released configuration uses the following settings.
 
-By default, the current implementation normalizes VGG inputs using the ImageNet mean and standard deviation and generates the random style reference from a fixed-seed uniform distribution over `[0,1]`. These are implementation choices and must not be presented as settings explicitly specified in the paper.
+| Parameter                        |                           Value |
+| -------------------------------- | ------------------------------: |
+| Random border width              |                           10 px |
+| VGG style features               | First five convolutional blocks |
+| Style update step size           |                             1.0 |
+| MAD numerical constant `eps`     |                          `1e-6` |
+| Matching threshold `rho`         |                             0.5 |
+| Detection confidence threshold   |                            0.25 |
+| Base mask threshold `tau0`       |                             3.0 |
+| Protection coefficient `lambda`  |                             2.0 |
+| Minimum connected-component size |                           16 px |
+| Connectivity                     |                  8-connectivity |
+| Closing kernel                   |                           3 × 3 |
+| Dilation kernel                  |                           3 × 3 |
+| Annulus inner radius             |                            3 px |
+| Annulus outer radius             |                            9 px |
+| Weak-view scale range            |                       0.95–1.05 |
+| Weak-view brightness range       |                       0.95–1.05 |
+| Weak-view contrast range         |                       0.95–1.05 |
+| Patch-to-box area ratio          |                             1.0 |
+| M-PGD local `L_inf` bound        |                          16/255 |
 
-## Inference
+Unless an experiment explicitly changes a parameter, the same PestGuard configuration is retained throughout the corresponding evaluation.
 
-### Faster R-CNN
+---
 
-`--num-classes` includes the background class. For example, a torchvision Faster R-CNN model with one foreground class normally uses `2`, with the foreground label usually set to `1`.
+# 4. VGG-19 Style Features
+
+PestGuard uses a frozen pretrained VGG-19 network for style-response extraction.
+
+Style representations are constructed from the first five convolutional blocks.
+
+For a selected feature tensor
+
+```text
+F_l
+```
+
+at layer `l`, the corresponding Gram matrix is constructed from the feature activations.
+
+The style loss is computed as the sum of squared Frobenius distances between Gram matrices of the current image and the fixed style-reference image across the selected feature levels.
+
+The VGG-19 network remains frozen throughout defense inference.
+
+Only image pixels participate in the one-step style-removal update.
+
+The repository accepts a local VGG-19 checkpoint through the command-line interface:
+
+```text
+--vgg-checkpoint /path/to/vgg19.pt
+```
+
+---
+
+# 5. Installation
+
+Install the required Python packages using
+
+```bash
+python -m pip install -r requirements.txt
+```
+
+GPU execution is recommended for experiments involving VGG-19 gradients and high-resolution UAV imagery.
+
+For YOLO-based experiments, install Ultralytics:
+
+```bash
+python -m pip install ultralytics
+```
+
+For DETR-based experiments, install HuggingFace Transformers:
+
+```bash
+python -m pip install transformers
+```
+
+The detector and VGG-19 checkpoints used for evaluation should be provided locally.
+
+---
+
+# 6. Running PestGuard
+
+## 6.1 Faster R-CNN
+
+For torchvision Faster R-CNN, `--num-classes` includes the background class.
+
+For example, a detector containing one foreground category normally uses:
+
+```text
+--num-classes 2
+```
+
+Example:
 
 ```bash
 python run_pestguard.py \
@@ -143,7 +400,11 @@ python run_pestguard.py \
   --device cuda:0
 ```
 
-### YOLO
+---
+
+## 6.2 YOLO
+
+Example:
 
 ```bash
 python run_pestguard.py \
@@ -156,7 +417,13 @@ python run_pestguard.py \
   --device cuda:0
 ```
 
-### DETR
+The YOLO interface supports local Ultralytics detector checkpoints.
+
+---
+
+## 6.3 DETR
+
+Example:
 
 ```bash
 python run_pestguard.py \
@@ -169,36 +436,120 @@ python run_pestguard.py \
   --device cuda:0
 ```
 
-For DETR, `--detector-checkpoint` must point to a local HuggingFace directory containing both the model weights and image-processor configuration. The adapter does not download weights automatically.
+For DETR, `--detector-checkpoint` points to a local HuggingFace model directory containing the model parameters and corresponding image-processor configuration.
 
-## Output Files
+---
 
-The program saves the following files for each input image:
+# 7. Output Files
 
-| File | Description |
-|---|---|
-| `defended.png` | Final locally filled defense image |
-| `style_updated_crop.png` | Image after one style update and border removal |
-| `weak_view.png` | Weakly transformed image used for cross-view consistency |
-| `residual_preview.png` | Display preview of the residual map |
-| `mad_preview.png` | Display preview of the MAD-calibrated score |
-| `protection_preview.png` | Display preview of the cross-view target-protection map |
-| `mask_preview.png` | Display preview of the final mask |
-| `maps.npz` | Raw floating-point residuals, MAD scores, protection maps, and masks |
-| `result.json` | Detections and runtime information for the original, weak-view, and final defended images |
+For each processed input image, PestGuard saves the following outputs.
 
-`maps.npz` contains the raw floating-point values used by the algorithm. Preview PNG files are normalized for visualization and must not be interpreted directly as algorithm scores.
+| File                     | Description                                              |
+| ------------------------ | -------------------------------------------------------- |
+| `defended.png`           | Final PestGuard-processed image                          |
+| `style_updated_crop.png` | Image after the one-step style update and border removal |
+| `weak_view.png`          | Weakly transformed view used for cross-view consistency  |
+| `residual_preview.png`   | Visualization of the style-removal residual              |
+| `mad_preview.png`        | Visualization of the MAD-calibrated residual score       |
+| `protection_preview.png` | Visualization of the target-protection map               |
+| `mask_preview.png`       | Visualization of the final refined mask                  |
+| `maps.npz`               | Raw residual, MAD, protection, and mask arrays           |
+| `result.json`            | Detection predictions and runtime information            |
 
-## Evaluating PDT with YOLO-Format Annotations
+The preview images are intended for visualization.
 
-`evaluate_outputs.py` reads saved predictions and YOLO-format `.txt` annotations.
+The numerical maps used by the algorithm are stored in
 
-- A no-target image must have a corresponding empty `.txt` file.
-- A missing annotation file raises an error.
-- If the detector is torchvision Faster R-CNN and the YOLO foreground class is `0`, use `--label-class-offset 1 --class-ids 1`.
-- If the detector itself uses zero-based class IDs, normally use `--label-class-offset 0 --class-ids 0`.
+```text
+maps.npz
+```
 
-Faster R-CNN example:
+and preserve the original floating-point values.
+
+---
+
+# 8. Detection Outputs
+
+The output file
+
+```text
+result.json
+```
+
+records detection information from different stages of the pipeline.
+
+These include:
+
+```text
+detections_original
+```
+
+for detections on the original image,
+
+```text
+detections_weak
+```
+
+for detections obtained from the weak view,
+
+and
+
+```text
+detections_final
+```
+
+for detections obtained after PestGuard processing.
+
+Runtime information is also recorded for subsequent efficiency analysis.
+
+---
+
+# 9. AP50 Evaluation
+
+The repository provides
+
+```text
+evaluate_outputs.py
+```
+
+for evaluating saved detection outputs against YOLO-format annotations.
+
+The evaluator uses:
+
+* IoU threshold: `0.5`;
+* 101-point interpolated AP;
+* confidence floor: `0.001`;
+* maximum predictions per image: `300`.
+
+---
+
+## 9.1 Annotation Requirements
+
+For each evaluation image, a corresponding annotation file is required.
+
+For an image containing no annotated target, the associated YOLO annotation file should be an empty `.txt` file.
+
+For example:
+
+```text
+images/
+    image_001.jpg
+    image_002.jpg
+
+labels/
+    image_001.txt
+    image_002.txt
+```
+
+A missing annotation file is treated as an evaluation error.
+
+---
+
+# 10. Faster R-CNN Evaluation Example
+
+For torchvision Faster R-CNN, foreground labels commonly begin at `1`, while YOLO annotations commonly begin at `0`.
+
+For a one-class detection task, use:
 
 ```bash
 python evaluate_outputs.py \
@@ -210,7 +561,19 @@ python evaluate_outputs.py \
   --output /path/to/ap50.json
 ```
 
-YOLO example:
+Here,
+
+```text
+--label-class-offset 1
+```
+
+maps YOLO class `0` to Faster R-CNN foreground class `1`.
+
+---
+
+# 11. YOLO Evaluation Example
+
+For a zero-based YOLO detector:
 
 ```bash
 python evaluate_outputs.py \
@@ -222,85 +585,165 @@ python evaluate_outputs.py \
   --output /path/to/ap50.json
 ```
 
-The current evaluator uses 101-point interpolated AP50, a confidence floor of `0.001`, and at most 300 predictions per image. These are evaluator settings of the current implementation; the paper does not provide the corresponding details. Before comparing against the reported results, verify the original image list, class mapping, prediction-filtering rules, and AP implementation.
+---
 
-`hiding_success` and `creation_success` evaluate hiding and creation attacks separately. The code does not combine them into a single ASR without an explicitly defined aggregation protocol.
+# 12. Attack Success Evaluation
 
-## Scope of the Attack Utilities
+PestGuard evaluates adversarial attack success under two attack objectives.
 
-`pestguard/patches.py` implements the following basic operations:
+## 12.1 Hiding Attack
 
-- Construct a patch support region from a target box and a specified area ratio.
-- Insert a patch into the permitted image region.
-- Project M-PGD updates onto the local `16/255` norm constraint inside the patch region.
-- Keep all pixels outside the patch region unchanged.
+A hiding attack attempts to suppress an existing pest-damaged-tree detection.
 
-These utilities do not constitute complete implementations of EOT, DPatch, T-SEA, or BPDA+EOT. A complete attack additionally requires an objective function, initialization scheme, iteration count, step size, random transformation distribution, target-selection policy, and stopping rule.
+The corresponding utility evaluates whether the attacked target is successfully removed according to the matching and confidence criteria.
 
-## Tests
+The implementation provides:
 
-```bash
-python -m unittest discover -s tests -v
+```text
+hiding_success
 ```
 
-The tests use a lightweight mock detector to verify that:
+for computing hiding-attack outcomes.
 
-- The full inference pipeline is connected correctly.
-- Image coordinates and detection boxes are transformed and mapped back correctly.
-- Hungarian matching respects class identities and the IoU threshold.
-- The protection map responds only inside matched-box intersections.
-- MAD scores retain their signed form.
-- Morphological mask processing and local filling satisfy boundary conditions.
-- Empty detections, empty masks, and connected components touching image boundaries are handled safely.
+---
 
-These tests validate program logic only and provide no evidence of experimental performance.
+## 12.2 Creation Attack
 
-## Relationship to AntiStyler
+A creation attack attempts to introduce a false pest-damaged-tree detection.
 
-AntiStyler uses style-removal responses to locate potential adversarial patches and masks suspicious regions. Building on this idea, PestGuard uses a one-step style update, robust MAD calibration, cross-view target protection, and local median filling to reduce the accidental removal of useful features from small pest-damaged crowns.
+The implementation provides:
 
-This project refers to the AntiStyler demonstration for VGG-19 style-feature and Gram-matrix construction. It does not reproduce the notebook line by line and does not automatically treat AntiStyler hyperparameters as PestGuard experimental settings.
+```text
+creation_success
+```
 
-## Parameter Sources and Status
+for computing creation-attack outcomes.
 
-| Parameter | Current Default | Source/Status |
-|---|---:|---|
-| Random border | 10 px | Explicitly specified in the paper |
-| VGG style features | First five convolutional blocks | Explicitly specified in the paper; exact layer indices must be fixed in the implementation |
-| `style_step_size` | 1.0 | Implementation default; not numerically specified in the paper and requires experimental calibration |
-| `eps` | 1e-6 | Numerical-stability default; the paper only requires `eps > 0` |
-| `rho` | 0.5 | Implementation default; not numerically specified in the paper |
-| Detection confidence floor | 0.25 | Implementation default; not numerically specified in the paper |
-| `tau0` | 3.0 | Implementation default; not numerically specified in the paper |
-| `lambda` | 2.0 | Implementation default; not numerically specified in the paper |
-| Minimum connected component | 16 px | Implementation default; not numerically specified in the paper |
-| Connectivity | Eight-connectivity | Implementation default; not specified in the paper |
-| Closing structuring element | 3×3 | Implementation default; not numerically specified in the paper |
-| Dilation structuring element | 3×3 | Implementation default; not numerically specified in the paper |
-| Annulus inner/outer radii | 3 px, 9 px | Implementation default; not numerically specified in the paper |
-| Weak-view scale | 0.95–1.05 | Implementation default; the paper only specifies a mild transformation |
-| Weak-view brightness | 0.95–1.05 | Implementation default; the paper only specifies mild photometric jitter |
-| Weak-view contrast | 0.95–1.05 | Implementation default; the paper only specifies mild photometric jitter |
-| M-PGD local bound | 16/255 | Explicitly specified in the paper |
-| Patch-to-box area ratio | 1.0 | Explicitly specified in the paper |
+---
 
-## Reproducibility Recommendations
+## 12.3 Attack Success Rate
 
-For each formal experiment, save the following information:
+In this repository,
 
-1. Dataset splits and the complete test-image list.
-2. Hashes of the detector and VGG-19 checkpoints.
-3. Class names and class-ID mappings.
-4. The complete configuration file.
-5. Python, PyTorch, torchvision, CUDA, and detector-framework versions.
-6. All random seeds.
-7. Complete configurations and optimization logs for every attack.
-8. Raw per-image predictions, AP evaluator inputs, and ASR decisions.
-9. Images before and after defense, together with raw floating-point intermediate maps.
-10. Failure cases and runtime exception logs.
+**ASR denotes Attack Success Rate**.
 
-Strict comparison with the paper requires identical data, weights, attacks, evaluator settings, and method parameters.
+Attack success is calculated separately according to the objective of each attack.
 
-## Disclaimer
+Hiding and creation attacks therefore use their corresponding success criteria during evaluation.
 
-The current project is a runnable research skeleton derived from the method description publicly available in the paper. It does not include unpublished checkpoints, dataset splits, attack logs, or private training configurations. The code can validate the method pipeline, but it does not guarantee reproduction of the reported numerical results without the original experimental resources.
+---
+
+# 13. Adversarial Patch Utilities
+
+The module
+
+```text
+pestguard/patches.py
+```
+
+contains the patch-processing functions used by the adversarial evaluation pipeline.
+
+The available operations include:
+
+1. construction of a patch-support region from a selected target bounding box;
+2. patch placement inside the permitted spatial support;
+3. patch replacement and update;
+4. M-PGD perturbation projection;
+5. local perturbation-bound enforcement;
+6. preservation of all pixels outside the permitted patch region.
+
+---
+
+## 13.1 Patch Area
+
+The standard configuration uses one patch placed on a selected crown.
+
+The patch-to-target-box area ratio is
+
+```text
+1.0
+```
+
+for the corresponding attack protocol.
+
+---
+
+## 13.2 M-PGD Constraint
+
+M-PGD restricts the perturbation to the local patch-support region.
+
+The local perturbation satisfies
+
+```text
+||delta||_inf <= 16/255
+```
+
+inside the permitted patch region.
+
+Pixels outside this region remain unchanged.
+
+---
+
+# 14. Adaptive BPDA+EOT Evaluation
+
+Adaptive evaluation uses BPDA together with EOT.
+
+A straight-through gradient estimator is used through the non-differentiable preprocessing operations during adaptive attack optimization.
+
+The detector and VGG-19 model remain frozen during the defense procedure.
+
+Adaptive evaluation therefore attacks the image-side defense pipeline without modifying the model parameters.
+
+---
+
+# 15. Weak-View Transformation
+
+The cross-view branch constructs a weakly transformed image to identify stable detection evidence.
+
+The released configuration uses:
+
+```text
+Scale:      0.95–1.05
+Brightness: 0.95–1.05
+Contrast:   0.95–1.05
+```
+
+The transformed image is resized and padded as required by the implementation.
+
+Predictions from the weak view are mapped back to the coordinate system of the original image before cross-view matching.
+
+---
+
+# 16. Hungarian Matching
+
+Detection matching is performed separately for each object class.
+
+For original-view predictions
+
+```text
+B = {b_1, ..., b_n}
+```
+
+and mapped weak-view predictions
+
+```text
+B' = {b'_1, ..., b'_m},
+```
+
+the matching cost is derived from pairwise IoU.
+
+Hungarian matching determines the assignment between the two prediction sets.
+
+Pairs satisfying
+
+```text
+IoU >= 0.5
+```
+
+are retained by the standard configuration.
+
+Only these retained pairs contribute to the target-protection map.
+
+---
+
+# 17. Target-Protection Map

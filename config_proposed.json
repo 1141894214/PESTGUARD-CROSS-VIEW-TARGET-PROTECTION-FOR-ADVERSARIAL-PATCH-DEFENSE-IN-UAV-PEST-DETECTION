@@ -1,0 +1,19 @@
+{
+  "border": 10,
+  "style_step_size": 1.0,
+  "style_seed": 42,
+  "border_seed": 43,
+  "weak_seed": 44,
+  "eps": 1e-6,
+  "match_iou": 0.5,
+  "confidence_cutoff": 0.25,
+  "tau0": 3.0,
+  "protection_lambda": 2.0,
+  "min_component_area": 16,
+  "ring_inner": 3,
+  "ring_outer": 9,
+  "target_class_ids": null,
+  "weak_scale_range": [0.95, 1.05],
+  "weak_brightness_range": [0.95, 1.05],
+  "weak_contrast_range": [0.95, 1.05]
+}
